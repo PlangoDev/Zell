@@ -1,0 +1,27 @@
+# === large archived data blobs (kept on disk under archive/, not in git) ===
+archive/plango-labs/test_011/data/*.bin
+
+# === build artifacts carried from the archive ===
+archive/plango-labs/test_011/showdown
+archive/plango-labs/test_012/showdown
+archive/plango-labs/test_012/showdown_*
+archive/plango-labs/test_012/demo
+archive/plango-labs/**/*.o
+*.out
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+
+# stray run logs
+run_*.log

@@ -1,0 +1,28 @@
+# build artifacts
+test_011/showdown
+test_011/*.o
+test_011/src/*.o
+test_012/showdown
+test_012/*.o
+test_012/src/*.o
+*.out
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+
+# stray run logs
+run_*.log
+test_012/showdown_*
+test_012/demo
+__pycache__/

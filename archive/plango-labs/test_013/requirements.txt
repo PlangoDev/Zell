@@ -1,0 +1,6 @@
+# Test 013 — PyTorch/HF stack (Kaggle GPU). torch is preinstalled on Kaggle;
+# transformers/datasets usually are too, but pin to be safe.
+torch>=2.1
+transformers>=4.40
+datasets>=2.18
+tokenizers>=0.15
