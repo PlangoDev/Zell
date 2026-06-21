@@ -1,0 +1,18 @@
+Zell
+Copyright 2026 PlangoDev
+
+This product includes software developed by PlangoDev.
+
+Zell builds on third-party models and datasets under their own licenses:
+- Qwen2.5-0.5B-Instruct (Apache-2.0), Alibaba Cloud
+- SmolLM2-1.7B-Instruct (Apache-2.0), Hugging Face
+- The Hugging Face datasets streamed by tools/build_blend.py (FineWeb-Edu,
+  Wikipedia, Cosmopedia, OpenWebMath, github-code-clean, UltraChat, SmolTalk,
+  Dolly) are used under their respective dataset licenses.
+
+The WikiText-103 strided-perplexity protocol and the Pythia-410M baseline (17.19)
+are used for benchmarking only.
+
+Synthetic training data produced by synth/generate.py is generated with
+third-party models served via OpenRouter; review the chosen model's terms before
+redistributing generated data.

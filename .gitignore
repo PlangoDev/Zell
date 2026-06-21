@@ -25,3 +25,12 @@ Thumbs.db
 
 # stray run logs
 run_*.log
+
+# === Zell generated artifacts (data + checkpoints, kept off git) ===
+synth/out/
+*.bin
+meta.json
+wikitext_meta.json
+scoreboard.json
+zell-core/
+llm_result.json

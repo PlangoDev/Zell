@@ -1,0 +1,13 @@
+# Zell training + data stack (Kaggle 2xT4, sm_75).
+# Versions are floors known to work with Qwen2.5 + TRL on Turing; Kaggle images
+# usually ship newer. Pin if a Kaggle image regresses.
+torch>=2.2
+transformers>=4.46
+datasets>=2.19
+accelerate>=0.34
+trl>=0.11
+bitsandbytes>=0.43      # paged_adamw_8bit optimizer state
+sentencepiece>=0.2
+numpy>=1.26
+# synth/generate.py uses only the stdlib (urllib) for the OpenRouter calls;
+# pass --count-with-qwen to count tokens exactly (needs transformers above).
