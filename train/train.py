@@ -14,8 +14,12 @@ Dual T4 (DDP):
 Speed notes for Kaggle 2xT4 (Turing, sm_75):
 - T4 has fp16 tensor cores but NOT bf16 tensor cores, so --precision fp16 is the
   fast default here; pass --precision bf16 to match the design-of-record dtype.
-- Packed fixed-length sequences = zero padding waste. Gradient checkpointing +
-  paged_adamw_8bit keep the 0.5B full fine-tune inside 16GB/GPU.
+- Liger fused linear-cross-entropy (auto, --liger off to disable) avoids ever
+  materializing the [batch, seq, 152k] logits tensor, the biggest memory and
+  bandwidth cost. It frees enough memory to run a larger micro-batch with
+  gradient checkpointing OFF (no recompute), which is the main throughput win.
+- Packed fixed-length sequences = zero padding waste. adamw_bnb_8bit keeps the
+  optimizer state ~1GB (no PCIe paging). Batch/accum auto-size from Liger.
 """
 import argparse
 import json
@@ -69,16 +73,20 @@ def main():
     ap.add_argument("--train-tokens", type=int, default=50_000_000,
                     help="token budget; max_steps derived from this and the effective batch")
     ap.add_argument("--seq-len", type=int, default=1024)
-    # T4 has only ~15GB and Qwen's 152k vocab makes the cross-entropy logits/
-    # softmax the dominant transient, so the micro-batch must stay small; raise
-    # grad-accum to keep tokens/step. Effective default = 2*16*1024 = 32768/GPU.
-    ap.add_argument("--per-device-batch", type=int, default=2)
-    ap.add_argument("--grad-accum", type=int, default=16)
+    ap.add_argument("--per-device-batch", type=int, default=0,
+                    help="0 = auto (8 with Liger fused-CE, else 2)")
+    ap.add_argument("--grad-accum", type=int, default=0,
+                    help="0 = auto so tokens/step ~= 65536")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--warmup-ratio", type=float, default=0.03)
     ap.add_argument("--precision", choices=["fp16", "bf16"], default="fp16")
+    ap.add_argument("--optim", default="adamw_bnb_8bit",
+                    help="adamw_bnb_8bit (1GB state) | adamw_torch_fused | paged_adamw_8bit")
+    ap.add_argument("--liger", choices=["on", "off"], default="on")
+    ap.add_argument("--grad-checkpoint", choices=["on", "off"], default="off",
+                    help="off is faster; on only if a big batch needs the memory")
     ap.add_argument("--save-steps", type=int, default=500)
-    ap.add_argument("--logging-steps", type=int, default=20)
+    ap.add_argument("--logging-steps", type=int, default=10)
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
@@ -88,25 +96,48 @@ def main():
     world = int(os.environ.get("WORLD_SIZE", "1"))
     is_main = int(os.environ.get("RANK", "0")) == 0
 
+    import time
     from transformers import (AutoModelForCausalLM, AutoTokenizer, Trainer,
-                              TrainingArguments, default_data_collator)
+                              TrainerCallback, TrainingArguments, default_data_collator)
+
+    # Liger fused kernels: fused linear-cross-entropy never materializes the
+    # [batch, seq, 152k] logits tensor, the dominant memory + bandwidth cost on
+    # this model. Big speedup and lets the micro-batch grow. Falls back cleanly
+    # if Liger/Triton is unavailable on this GPU.
+    liger_ok = False
+    if args.liger == "on":
+        try:
+            from liger_kernel.transformers import apply_liger_kernel_to_qwen2
+            apply_liger_kernel_to_qwen2()
+            liger_ok = True
+        except Exception as e:
+            if is_main:
+                print(f"  liger: unavailable ({type(e).__name__}: {e}); standard path", flush=True)
+
+    # Auto-size batch/accum from whether Liger freed the logits memory.
+    if args.per_device_batch <= 0:
+        args.per_device_batch = 8 if liger_ok else 2
+    if args.grad_accum <= 0:
+        args.grad_accum = max(1, 65536 // (args.per_device_batch * args.seq_len * max(world, 1)))
+    use_ckpt = (args.grad_checkpoint == "on")
 
     tok = AutoTokenizer.from_pretrained(meta["model_id"])
     # Force fp32 master weights. transformers v5 otherwise loads the checkpoint's
     # native dtype (Qwen ships bf16), and the fp16 GradScaler cannot unscale bf16
-    # or fp16 gradients ("Attempting to unscale FP16 gradients" /
-    # "_amp_foreach_non_finite_check_and_unscale_ not implemented for BFloat16").
-    # Mixed precision comes only from the fp16/bf16 TrainingArguments flags below.
+    # or fp16 gradients. Mixed precision comes only from the fp16/bf16 flags below.
     model = AutoModelForCausalLM.from_pretrained(
         meta["model_id"], torch_dtype=torch.float32, attn_implementation="sdpa")
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
+    if use_ckpt:
+        model.gradient_checkpointing_enable()
 
     ds = PackedBlocks(meta["train_path"], dtype, args.seq_len, meta["train_tokens"])
     tokens_per_step = args.per_device_batch * args.grad_accum * args.seq_len * world
     max_steps = max(1, args.train_tokens // tokens_per_step)
-    warmup_steps = max(1, round(args.warmup_ratio * max_steps))   # warmup_ratio is deprecated in v5
+    warmup_steps = max(1, round(args.warmup_ratio * max_steps))   # warmup_ratio deprecated in v5
     if is_main:
+        print(f"  cfg: liger={liger_ok} batch={args.per_device_batch} accum={args.grad_accum} "
+              f"ckpt={use_ckpt} optim={args.optim} precision={args.precision}", flush=True)
         print(f"  data: {len(ds):,} blocks of {args.seq_len} | {tokens_per_step:,} tok/step "
               f"| {max_steps:,} steps for {args.train_tokens:,} tokens (world={world})", flush=True)
 
@@ -120,11 +151,11 @@ def main():
         lr_scheduler_type="cosine",
         weight_decay=0.1,
         max_grad_norm=1.0,
-        optim="paged_adamw_8bit",
+        optim=args.optim,
         bf16=(args.precision == "bf16"),
         fp16=(args.precision == "fp16"),
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing=use_ckpt,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if use_ckpt else None,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=2,
@@ -133,8 +164,18 @@ def main():
         ddp_find_unused_parameters=False,
     )
 
+    class Throughput(TrainerCallback):
+        def on_train_begin(self, *args, **kwargs):
+            self.t0 = time.time()
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if is_main and logs and "loss" in logs:
+                dt = time.time() - self.t0
+                seen = state.global_step * tokens_per_step
+                print(f"    step {state.global_step}/{max_steps}  loss {logs['loss']:.3f}  "
+                      f"~{seen / max(dt, 1):,.0f} tok/s", flush=True)
+
     trainer = Trainer(model=model, args=targs, train_dataset=ds,
-                      data_collator=default_data_collator)
+                      data_collator=default_data_collator, callbacks=[Throughput()])
     trainer.train(resume_from_checkpoint=args.resume)
 
     if is_main:
