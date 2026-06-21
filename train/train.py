@@ -69,8 +69,11 @@ def main():
     ap.add_argument("--train-tokens", type=int, default=50_000_000,
                     help="token budget; max_steps derived from this and the effective batch")
     ap.add_argument("--seq-len", type=int, default=1024)
-    ap.add_argument("--per-device-batch", type=int, default=8)
-    ap.add_argument("--grad-accum", type=int, default=4)
+    # T4 has only ~15GB and Qwen's 152k vocab makes the cross-entropy logits/
+    # softmax the dominant transient, so the micro-batch must stay small; raise
+    # grad-accum to keep tokens/step. Effective default = 2*16*1024 = 32768/GPU.
+    ap.add_argument("--per-device-batch", type=int, default=2)
+    ap.add_argument("--grad-accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--warmup-ratio", type=float, default=0.03)
     ap.add_argument("--precision", choices=["fp16", "bf16"], default="fp16")
