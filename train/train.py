@@ -92,17 +92,20 @@ def main():
                               TrainingArguments, default_data_collator)
 
     tok = AutoTokenizer.from_pretrained(meta["model_id"])
-    # Load fp32 master weights. Mixed precision is handled by the fp16/bf16 flags
-    # below (autocast + GradScaler); loading the weights themselves in fp16 makes
-    # the GradScaler fail with "Attempting to unscale FP16 gradients".
+    # Force fp32 master weights. transformers v5 otherwise loads the checkpoint's
+    # native dtype (Qwen ships bf16), and the fp16 GradScaler cannot unscale bf16
+    # or fp16 gradients ("Attempting to unscale FP16 gradients" /
+    # "_amp_foreach_non_finite_check_and_unscale_ not implemented for BFloat16").
+    # Mixed precision comes only from the fp16/bf16 TrainingArguments flags below.
     model = AutoModelForCausalLM.from_pretrained(
-        meta["model_id"], attn_implementation="sdpa")
+        meta["model_id"], torch_dtype=torch.float32, attn_implementation="sdpa")
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
     ds = PackedBlocks(meta["train_path"], dtype, args.seq_len, meta["train_tokens"])
     tokens_per_step = args.per_device_batch * args.grad_accum * args.seq_len * world
     max_steps = max(1, args.train_tokens // tokens_per_step)
+    warmup_steps = max(1, round(args.warmup_ratio * max_steps))   # warmup_ratio is deprecated in v5
     if is_main:
         print(f"  data: {len(ds):,} blocks of {args.seq_len} | {tokens_per_step:,} tok/step "
               f"| {max_steps:,} steps for {args.train_tokens:,} tokens (world={world})", flush=True)
@@ -113,7 +116,7 @@ def main():
         per_device_train_batch_size=args.per_device_batch,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
         weight_decay=0.1,
         max_grad_norm=1.0,
@@ -138,6 +141,8 @@ def main():
         trainer.save_model(args.out_dir)
         tok.save_pretrained(args.out_dir)
         print(f"  saved core -> {args.out_dir}", flush=True)
+        model.config.use_cache = True              # re-enable KV cache for generation
+        model.gradient_checkpointing_disable()
         sample_generations(model, tok, model.device, [
             "Explain how a suffix array works, briefly.",
             "Write a Python function that returns the n-th Fibonacci number.",
