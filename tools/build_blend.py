@@ -55,8 +55,11 @@ SOURCES = [
      "split": "train", "field": "text", "kind": "text", "weight": 0.12},
     {"name": "open-web-math", "hf": "open-web-math/open-web-math", "config": None,
      "split": "train", "field": "text", "kind": "text", "weight": 0.10},
+    # github-code-clean ships a loading script (blocked by datasets>=3); stream the
+    # auto-converted parquet branch instead.
     {"name": "github-code", "hf": "codeparrot/github-code-clean", "config": "Python-all",
-     "split": "train", "field": "code", "kind": "text", "weight": 0.10},
+     "split": "train", "field": "code", "kind": "text", "weight": 0.10,
+     "revision": "refs/convert/parquet"},
     {"name": "ultrachat", "hf": "HuggingFaceH4/ultrachat_200k", "config": None,
      "split": "train_sft", "field": "messages", "kind": "chat_messages", "weight": 0.06},
     {"name": "smoltalk", "hf": "HuggingFaceTB/smoltalk", "config": "all",
@@ -171,31 +174,42 @@ def main():
 
     from datasets import load_dataset
 
-    # ---- resolve synthetic source (drop + renormalize if absent) ----
+    # ---- resolve synthetic source (drop if absent) ----
     synth_paths = sorted(glob.glob(args.synth_glob)) if args.synth_glob else []
     sources = [dict(s) for s in SOURCES]
     if not synth_paths:
-        dropped = next((s for s in sources if s["kind"] == "synth_jsonl"), None)
-        if dropped:
+        if any(s["kind"] == "synth_jsonl" for s in sources):
             print(f"  synth: no files matched {args.synth_glob!r}; dropping synth source", flush=True)
             sources = [s for s in sources if s["kind"] != "synth_jsonl"]
     else:
         print(f"  synth: {len(synth_paths)} file(s) matched {args.synth_glob!r}", flush=True)
-    wsum = sum(s["weight"] for s in sources)
-    for s in sources:
-        s["weight"] /= wsum
 
-    # ---- per-source quotas + streaming iterators ----
-    quota = {s["name"]: int(round(s["weight"] * args.pool_tokens)) for s in sources}
-    written = {s["name"]: 0 for s in sources}
+    # ---- build streaming iterators; drop any source that fails to load ----
     iters = {}
+    surviving = []
     for s in sources:
         if s["kind"] == "synth_jsonl":
             iters[s["name"]] = _synth_iter(synth_paths)
-        else:
-            ds = load_dataset(s["hf"], s["config"], split=s["split"], streaming=True)
+            surviving.append(s)
+            continue
+        try:
+            ds = load_dataset(s["hf"], s["config"], split=s["split"], streaming=True,
+                              revision=s.get("revision"))
             ds = ds.shuffle(seed=args.seed, buffer_size=10_000)
             iters[s["name"]] = iter(ds)
+            surviving.append(s)
+        except Exception as e:
+            print(f"  source {s['name']} ({s['hf']}) failed to load; dropping. {e}", flush=True)
+    sources = surviving
+    if not sources:
+        raise SystemExit("no usable sources; aborting blend build")
+
+    # ---- renormalize weights over survivors, then quotas ----
+    wsum = sum(s["weight"] for s in sources)
+    for s in sources:
+        s["weight"] /= wsum
+    quota = {s["name"]: int(round(s["weight"] * args.pool_tokens)) for s in sources}
+    written = {s["name"]: 0 for s in sources}
     active = [s["name"] for s in sources]
     src_by_name = {s["name"]: s for s in sources}
 
