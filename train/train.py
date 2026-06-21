@@ -92,10 +92,11 @@ def main():
                               TrainingArguments, default_data_collator)
 
     tok = AutoTokenizer.from_pretrained(meta["model_id"])
+    # Load fp32 master weights. Mixed precision is handled by the fp16/bf16 flags
+    # below (autocast + GradScaler); loading the weights themselves in fp16 makes
+    # the GradScaler fail with "Attempting to unscale FP16 gradients".
     model = AutoModelForCausalLM.from_pretrained(
-        meta["model_id"],
-        torch_dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16,
-        attn_implementation="sdpa")
+        meta["model_id"], attn_implementation="sdpa")
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
