@@ -15,9 +15,10 @@ Speed notes for Kaggle 2xT4 (Turing, sm_75):
 - T4 has fp16 tensor cores but NOT bf16 tensor cores, so --precision fp16 is the
   fast default here; pass --precision bf16 to match the design-of-record dtype.
 - Liger fused linear-cross-entropy (auto, --liger off to disable) avoids ever
-  materializing the [batch, seq, 152k] logits tensor, the biggest memory and
-  bandwidth cost. It frees enough memory to run a larger micro-batch with
-  gradient checkpointing OFF (no recompute), which is the main throughput win.
+  materializing the [batch, seq, 152k] logits tensor: the biggest memory and
+  bandwidth cost. Gradient checkpointing frees the 24-layer activation memory.
+  With both, memory is ~weights+grads+optimizer, so a large micro-batch fits,
+  and the large batch (not skipping recompute) is the real throughput win here.
 - Packed fixed-length sequences = zero padding waste. adamw_bnb_8bit keeps the
   optimizer state ~1GB (no PCIe paging). Batch/accum auto-size from Liger.
 """
@@ -80,7 +81,7 @@ def main():
                     help="token budget; max_steps derived from this and the effective batch")
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--per-device-batch", type=int, default=0,
-                    help="0 = auto (8 with Liger fused-CE, else 2)")
+                    help="0 = auto (16 with Liger fused-CE, else 2)")
     ap.add_argument("--grad-accum", type=int, default=0,
                     help="0 = auto so tokens/step ~= 65536")
     ap.add_argument("--lr", type=float, default=2e-5)
@@ -89,8 +90,9 @@ def main():
     ap.add_argument("--optim", default="adamw_bnb_8bit",
                     help="adamw_bnb_8bit (1GB state) | adamw_torch_fused | paged_adamw_8bit")
     ap.add_argument("--liger", choices=["on", "off"], default="on")
-    ap.add_argument("--grad-checkpoint", choices=["on", "off"], default="off",
-                    help="off is faster; on only if a big batch needs the memory")
+    ap.add_argument("--grad-checkpoint", choices=["on", "off"], default="on",
+                    help="on frees activation memory so the batch can be large, "
+                         "which is the real throughput win on a 15GB T4")
     ap.add_argument("--save-steps", type=int, default=500)
     ap.add_argument("--logging-steps", type=int, default=2)   # frequent -> livelier sparkline
     ap.add_argument("--resume", action="store_true")
@@ -120,12 +122,14 @@ def main():
             if is_main:
                 print(f"  liger: unavailable ({type(e).__name__}: {e}); standard path", flush=True)
 
-    # Auto-size batch/accum from whether Liger freed the logits memory.
+    # Liger frees the logits memory, gradient checkpointing frees the activation
+    # memory; together a large micro-batch fits, and that is the real throughput
+    # win on a 15GB T4. Without Liger the 152k-vocab logits force a tiny batch.
+    use_ckpt = (args.grad_checkpoint == "on")
     if args.per_device_batch <= 0:
-        args.per_device_batch = 8 if liger_ok else 2
+        args.per_device_batch = 16 if (liger_ok and use_ckpt) else (8 if liger_ok else 2)
     if args.grad_accum <= 0:
         args.grad_accum = max(1, 65536 // (args.per_device_batch * args.seq_len * max(world, 1)))
-    use_ckpt = (args.grad_checkpoint == "on")
 
     tok = AutoTokenizer.from_pretrained(meta["model_id"])
     # Force fp32 master weights. transformers v5 otherwise loads the checkpoint's
