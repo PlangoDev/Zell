@@ -54,7 +54,11 @@ class PackedBlocks(Dataset):
 
 @torch.no_grad()
 def sample_generations(model, tok, device, prompts, max_new=120):
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import viz
     model.eval()
+    print("\n" + viz.paint("  ╶─ sample generations ─╴", viz.PURPLE, bold=True), flush=True)
     for p in prompts:
         text = tok.apply_chat_template([{"role": "user", "content": p}],
                                        tokenize=False, add_generation_prompt=True)
@@ -62,7 +66,9 @@ def sample_generations(model, tok, device, prompts, max_new=120):
         out = model.generate(**ids, max_new_tokens=max_new, do_sample=True,
                              temperature=0.7, top_p=0.9, pad_token_id=tok.eos_token_id)
         gen = tok.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
-        print(f"\n  [user] {p}\n  [zell] {gen.strip()}", flush=True)
+        print("\n  " + viz.paint("user", viz.CYAN, bold=True) + "  " + p, flush=True)
+        print("  " + viz.paint("zell", viz.PINK, bold=True) + "  "
+              + viz.paint(gen.strip(), viz.WHITE), flush=True)
     model.train()
 
 
@@ -86,7 +92,7 @@ def main():
     ap.add_argument("--grad-checkpoint", choices=["on", "off"], default="off",
                     help="off is faster; on only if a big batch needs the memory")
     ap.add_argument("--save-steps", type=int, default=500)
-    ap.add_argument("--logging-steps", type=int, default=10)
+    ap.add_argument("--logging-steps", type=int, default=2)   # frequent -> livelier sparkline
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
@@ -161,21 +167,51 @@ def main():
         save_total_limit=2,
         dataloader_num_workers=2,
         report_to="none",
+        disable_tqdm=True,            # the live dashboard replaces the default bar
         ddp_find_unused_parameters=False,
     )
 
-    class Throughput(TrainerCallback):
-        def on_train_begin(self, *args, **kwargs):
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # find sibling viz.py
+    import viz
+    dash = viz.LiveDashboard(
+        max_steps, tokens_per_step, title="ZELL",
+        subtitle=f"{meta['model_id']} · {args.train_tokens:,} tokens · world {world}",
+        meta_line=f"liger {'on' if liger_ok else 'off'} · batch {args.per_device_batch} "
+                  f"· accum {args.grad_accum} · {args.precision} · {args.optim}")
+
+    def gpu_mem():
+        if not torch.cuda.is_available():
+            return 0.0, 0.0
+        free, total = torch.cuda.mem_get_info()
+        return (total - free) / 1e9, total / 1e9
+
+    class Dashboard(TrainerCallback):
+        def on_train_begin(self, *a, **k):
             self.t0 = time.time()
-        def on_log(self, args, state, control, logs=None, **kwargs):
+            self.loss = None
+            if is_main:
+                dash.banner()
+        def on_log(self, args, state, control, logs=None, **k):
             if is_main and logs and "loss" in logs:
-                dt = time.time() - self.t0
-                seen = state.global_step * tokens_per_step
-                print(f"    step {state.global_step}/{max_steps}  loss {logs['loss']:.3f}  "
-                      f"~{seen / max(dt, 1):,.0f} tok/s", flush=True)
+                self.loss = logs["loss"]
+                dash.add_loss(self.loss)
+        def on_step_end(self, args, state, control, **k):
+            if not is_main:
+                return
+            dt = time.time() - self.t0
+            dash.set_elapsed(dt)
+            tok_s = state.global_step * tokens_per_step / max(dt, 1e-6)
+            used, total = gpu_mem()
+            dash.tick(state.global_step, self.loss, tok_s, used, total)
+            if state.global_step % 50 == 0:
+                dash.snapshot(state.global_step, "milestone")
+        def on_train_end(self, *a, **k):
+            if is_main:
+                dash.done()
 
     trainer = Trainer(model=model, args=targs, train_dataset=ds,
-                      data_collator=default_data_collator, callbacks=[Throughput()])
+                      data_collator=default_data_collator, callbacks=[Dashboard()])
     trainer.train(resume_from_checkpoint=args.resume)
 
     if is_main:
