@@ -149,9 +149,8 @@ class LiveDashboard:
             loss_s = paint("  ··· ", GREY)
         else:
             loss_s = paint(f"{loss:6.3f}", ORANGE, bold=True) + " " + self._trend(loss)
-        tps = paint(f"{tok_s:>6,.0f}", GREEN) + paint(" tok/s", GREY)
-        elapsed_frac = step / self.total
-        eta = (1 - elapsed_frac) / elapsed_frac * self._elapsed if elapsed_frac > 0 else 0
+        tps = paint(f"{tok_s:>7,.0f}", GREEN, bold=True) + paint(" tok/s", GREY)
+        eta = (self.total - step) * (self.tps / tok_s) if tok_s > 0 else 0
         eta_s = paint(hms(eta), PINK)
         spark = sparkline(self.losses)
         mem = ""
@@ -174,12 +173,6 @@ class LiveDashboard:
                f"{paint('│', GREY)} loss {cur} {paint('│', GREY)} best {best} "
                f"{paint('│', GREY)} {sparkline(self.losses, 44)}")
         print(msg, flush=True)
-
-    # set by the callback each tick so ETA can use real elapsed seconds
-    _elapsed = 1.0
-
-    def set_elapsed(self, sec):
-        self._elapsed = max(sec, 1e-6)
 
     def done(self):
         best = paint(f"{self.best:.3f}", GREEN, bold=True) if self.best is not None else "?"

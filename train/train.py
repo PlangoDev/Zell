@@ -90,6 +90,8 @@ def main():
     ap.add_argument("--optim", default="adamw_bnb_8bit",
                     help="adamw_bnb_8bit (1GB state) | adamw_torch_fused | paged_adamw_8bit")
     ap.add_argument("--liger", choices=["on", "off"], default="on")
+    ap.add_argument("--compile", choices=["on", "off"], default="off",
+                    help="torch.compile the model (experimental on T4; ~1.3-1.8x if it builds)")
     ap.add_argument("--grad-checkpoint", choices=["on", "off"], default="on",
                     help="on frees activation memory so the batch can be large, "
                          "which is the real throughput win on a 15GB T4")
@@ -146,8 +148,9 @@ def main():
     max_steps = max(1, args.train_tokens // tokens_per_step)
     warmup_steps = max(1, round(args.warmup_ratio * max_steps))   # warmup_ratio deprecated in v5
     if is_main:
-        print(f"  cfg: liger={liger_ok} batch={args.per_device_batch} accum={args.grad_accum} "
-              f"ckpt={use_ckpt} optim={args.optim} precision={args.precision}", flush=True)
+        print(f"  cfg: liger={liger_ok} compile={args.compile} batch={args.per_device_batch} "
+              f"accum={args.grad_accum} ckpt={use_ckpt} optim={args.optim} "
+              f"precision={args.precision}", flush=True)
         print(f"  data: {len(ds):,} blocks of {args.seq_len} | {tokens_per_step:,} tok/step "
               f"| {max_steps:,} steps for {args.train_tokens:,} tokens (world={world})", flush=True)
 
@@ -166,6 +169,7 @@ def main():
         fp16=(args.precision == "fp16"),
         gradient_checkpointing=use_ckpt,
         gradient_checkpointing_kwargs={"use_reentrant": False} if use_ckpt else None,
+        torch_compile=(args.compile == "on"),
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=2,
@@ -192,7 +196,8 @@ def main():
 
     class Dashboard(TrainerCallback):
         def on_train_begin(self, *a, **k):
-            self.t0 = time.time()
+            self.last = time.time()
+            self.ema = None          # EMA of per-step seconds -> instantaneous tok/s
             self.loss = None
             if is_main:
                 dash.banner()
@@ -203,9 +208,12 @@ def main():
         def on_step_end(self, args, state, control, **k):
             if not is_main:
                 return
-            dt = time.time() - self.t0
-            dash.set_elapsed(dt)
-            tok_s = state.global_step * tokens_per_step / max(dt, 1e-6)
+            now = time.time()
+            step_dt = now - self.last
+            self.last = now
+            # EMA so warmup / Triton compile on early steps does not dominate
+            self.ema = step_dt if self.ema is None else 0.85 * self.ema + 0.15 * step_dt
+            tok_s = tokens_per_step / max(self.ema, 1e-6)
             used, total = gpu_mem()
             dash.tick(state.global_step, self.loss, tok_s, used, total)
             if state.global_step % 50 == 0:
